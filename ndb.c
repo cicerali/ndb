@@ -1,10 +1,11 @@
 /*
  ============================================================================
  Name        : ndb.c
- Author      : Ali Temel Cicerali
+ Author      : cicerali
  Version     :
  Copyright   : 
  Description : Android phone detector
+ Build cmd   : gcc -o ndb ndb.c
  ============================================================================
  */
 
@@ -12,21 +13,66 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <linux/usb/ch9.h>
 
-#include "utils.h"
+#define LEVEL_DEBUG 1 << 0
 
-int main(void)
+#define PRINT(level, type, format, args...) {\
+	if( level & g_level ){\
+		fprintf(stdout, "[%5s] %8s: %8s(%d) # ", type, __FILE__, __FUNCTION__, __LINE__);\
+		fprintf(stdout, format , ##args);\
+		fprintf(stdout, "\n");\
+	}\
+}
+
+#define LOG_DEBUG(format, args...) PRINT(LEVEL_DEBUG, "DEBUG", format, ##args)
+
+#define ADB_CLASS 0xff
+#define ADB_SUBCLASS 0x42
+#define ADB_PROTOCOL 0x1
+
+#define USB_DEV_PATH "/dev/bus/usb"
+typedef struct dirent dirent;
+
+int contains_non_digit(const char* name);
+int is_adb_interface(int usb_class, int usb_subclass, int usb_protocol);
+
+#define  unix_read   adb_read
+#define  unix_close  adb_close
+
+int unix_open(const char* path, int options, ...);
+int adb_read(int fd, void* buf, size_t len);
+int adb_close(int fd);
+
+int g_level = 0x00;
+
+int main(int argc, char *argv[])
 {
+	if (geteuid() != 0)
+	{
+		fprintf(stderr, "This application must be run as root\n");
+		return EPERM;
+	}
 
+	if (argc == 2 && strcmp(argv[1], "-v") == 0)
+		g_level = 0x01;
+	LOG_DEBUG("Welcome my Lords to ISENGARD");
+	char bus[16] =
+	{ 0 };
+	char dev[16] =
+	{ 0 };
 	DIR *bus_dir = opendir(USB_DEV_PATH);
 	if (bus_dir == NULL)
 		return errno;
 
+	LOG_DEBUG("bus_dir:%s opened\n", USB_DEV_PATH);
 	dirent* de;
 	while ((de = readdir(bus_dir)) != NULL)
 	{
@@ -35,11 +81,13 @@ int main(void)
 		char *bus_name = (char *) malloc(
 				strlen(USB_DEV_PATH) + strlen(de->d_name) + 2);
 		sprintf(bus_name, "%s/%s", USB_DEV_PATH, de->d_name);
+		strncpy(bus, de->d_name, 16);
 
 		DIR *dev_dir = opendir(bus_name);
 		if (dev_dir == NULL)
 			continue;
 
+		LOG_DEBUG("dev_dir:%s opened\n", bus_name);
 		while ((de = readdir(dev_dir)))
 		{
 			unsigned char devdesc[4096];
@@ -58,17 +106,20 @@ int main(void)
 
 			char *dev_name = (char *) malloc(
 					strlen(bus_name) + strlen(de->d_name) + 2);
-			sprintf(bus_name, "%s/%s", bus_name, de->d_name);
+			sprintf(dev_name, "%s/%s", bus_name, de->d_name);
+			strncpy(dev, de->d_name, 16);
+			LOG_DEBUG("dev_name:%s ", dev_name);
 
-			int fd = unix_open(dev_name, O_RDONLY | O_CLOEXEC);
+			int fd = unix_open(dev_name, O_RDONLY);
 			if (fd == -1)
 				continue;
+			LOG_DEBUG("opened\n");
 
 			size_t desclength = unix_read(fd, devdesc, sizeof(devdesc));
 			bufend = bufptr + desclength;
 			if (desclength < USB_DT_DEVICE_SIZE + USB_DT_CONFIG_SIZE)
 			{
-				fprintf(stderr, "desclength %zu is too small\n", desclength);
+				LOG_DEBUG("desclength %zu is too small\n", desclength);
 				unix_close(fd);
 				continue;
 			}
@@ -83,14 +134,14 @@ int main(void)
 			}
 			vid = device->idVendor;
 			pid = device->idProduct;
-			fprintf(stderr, "[ %s is V:%04x P:%04x ]\n", dev_name, vid, pid);
+			LOG_DEBUG("[ %s is V:%04x P:%04x ]\n", dev_name, vid, pid);
 
 			config = (struct usb_config_descriptor *) bufptr;
 			bufptr += USB_DT_CONFIG_SIZE;
 			if (config->bLength != USB_DT_CONFIG_SIZE
 					|| config->bDescriptorType != USB_DT_CONFIG)
 			{
-				fprintf(stderr, "usb_config_descriptor not found\n");
+				LOG_DEBUG("usb_config_descriptor not found\n");
 				unix_close(fd);
 				continue;
 			}
@@ -106,10 +157,10 @@ int main(void)
 
 					if (length != USB_DT_INTERFACE_SIZE)
 					{
-						fprintf(stderr, "interface descriptor has wrong size\n");
+						LOG_DEBUG("interface descriptor has wrong size\n");
 						break;
 					}
-					fprintf(stderr, "bInterfaceClass: %d,  bInterfaceSubClass: %d,"
+					LOG_DEBUG("bInterfaceClass: %d,  bInterfaceSubClass: %d,"
 							"bInterfaceProtocol: %d, bNumEndpoints: %d\n",
 							interface->bInterfaceClass,
 							interface->bInterfaceSubClass,
@@ -125,7 +176,7 @@ int main(void)
 						char pathbuf[128];
 						char link[256];
 						char *devpath = NULL;
-						fprintf(stderr, "looking for bulk endpoints\n");
+						LOG_DEBUG("looking for bulk endpoints\n");
 
 						ep1 = (struct usb_endpoint_descriptor *) bufptr;
 						bufptr += USB_DT_ENDPOINT_SIZE;
@@ -151,14 +202,14 @@ int main(void)
 						ep2->bLength != USB_DT_ENDPOINT_SIZE ||
 						ep2->bDescriptorType != USB_DT_ENDPOINT)
 						{
-							fprintf(stderr, "endpoints not found\n");
+							LOG_DEBUG("endpoints not found\n");
 							break;
 						}
 
 						if (ep1->bmAttributes != USB_ENDPOINT_XFER_BULK
 								|| ep2->bmAttributes != USB_ENDPOINT_XFER_BULK)
 						{
-							fprintf(stderr, "bulk endpoints not found\n");
+							LOG_DEBUG("bulk endpoints not found\n");
 							continue;
 						}
 
@@ -200,10 +251,29 @@ int main(void)
 							}
 						}
 
-						fprintf(stderr, "dev_name: %s, devpath: %s\n", dev_name, devpath);
+						LOG_DEBUG("dev_name: %s, devpath: %s\n", dev_name,
+								devpath);
+						char *serial_path = (char *) malloc(256);
+						snprintf(serial_path, 256,
+								"/sys/bus/usb/devices/%s/serial", devpath + 4);
+
+						FILE *fp;
+						char serial[256] =
+						{ 0 };
+						fp = fopen(serial_path, "r");
+						fgets(serial, 256, fp);
+						serial[strcspn(serial, "\n")] = '\0';
+						fclose(fp);
+						fprintf(stdout, "%s:%s:%s\n", serial, bus, dev);
+
 						break;
 					}
 				}
+				else if(type == USB_DT_CONFIG)
+                {
+                    LOG_DEBUG("Another configuration found, skipping device\n");
+                    break;
+                }
 				else
 				{
 					bufptr += length;
@@ -221,6 +291,60 @@ int main(void)
 	if (bus_dir != NULL)
 		closedir(bus_dir);
 
-	fprintf(stderr, "End of Game\n");
+	LOG_DEBUG("Game over!\n");
 	return EXIT_SUCCESS;
+}
+
+int contains_non_digit(const char* name)
+{
+	while (*name)
+	{
+		if (!isdigit(*name++))
+			return 1;
+	}
+	return 0;
+}
+
+int is_adb_interface(int usb_class, int usb_subclass, int usb_protocol)
+{
+	return (usb_class == ADB_CLASS && usb_subclass == ADB_SUBCLASS
+			&& usb_protocol == ADB_PROTOCOL);
+}
+
+#ifndef TEMP_FAILURE_RETRY
+#define TEMP_FAILURE_RETRY(exp)            \
+  ({                                       \
+    long int _rc;                     		\
+    do {                                   \
+      _rc = (long int) (exp);                         \
+    } while (_rc == -1 && errno == EINTR); \
+    _rc;                                   \
+  })
+#endif
+
+int unix_open(const char* path, int options, ...)
+{
+	if ((options & O_CREAT) == 0)
+	{
+		return TEMP_FAILURE_RETRY(open(path, options));
+	}
+	else
+	{
+		int mode;
+		va_list args;
+		va_start(args, options);
+		mode = va_arg(args, int);
+		va_end(args);
+		return TEMP_FAILURE_RETRY(open(path, options, mode));
+	}
+}
+
+int adb_read(int fd, void* buf, size_t len)
+{
+	return TEMP_FAILURE_RETRY(read(fd, buf, len));
+}
+
+int adb_close(int fd)
+{
+	return close(fd);
 }
